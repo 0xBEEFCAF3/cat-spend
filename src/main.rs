@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{collections::BTreeMap, str::FromStr};
 
 use miniscript::psbt::PsbtExt;
 use rand::rngs::OsRng;
@@ -11,14 +11,7 @@ use secp256k1::{
 };
 
 use bitcoin::{
-    blockdata::opcodes,
-    key::{self, TapTweak},
-    locktime,
-    psbt::{self, PartiallySignedTransaction},
-    script,
-    sighash::{self, TapSighashType},
-    taproot::{self, TaprootBuilder, TaprootSpendInfo},
-    Address, OutPoint, Script, Sequence, Txid,
+    blockdata::opcodes, consensus::Encodable, key::{self, TapTweak}, locktime, psbt::{self, PartiallySignedTransaction}, script, sighash::{self, ScriptPath, TapSighashType}, taproot::{self, LeafVersion, TapLeafHash, TaprootBuilder, TaprootSpendInfo}, Address, OutPoint, Script, Sequence, Txid, Witness
 };
 use bitcoin::{blockdata::script::Builder, ScriptBuf};
 use hex;
@@ -41,14 +34,14 @@ pub fn generate_bip340_keypair() -> KeyPair {
 
 /// Take some byte, dups it and CATs it
 /// Then checks if the result
-fn create_taproot_script(some_data: [u8; 8]) -> ScriptBuf {
+fn create_taproot_script(data: [u8; 8]) -> ScriptBuf {
     let mut data_duped: [u8; 16] = [0; 16];
 
-    data_duped[..8].copy_from_slice(&some_data);
-    data_duped[8..].copy_from_slice(&some_data);
+    data_duped[..8].copy_from_slice(&data);
+    data_duped[8..].copy_from_slice(&data);
 
     let script = Builder::new()
-        .push_slice(some_data)
+        .push_slice(data)
         .push_opcode(opcodes::all::OP_DUP)
         .push_opcode(opcodes::all::OP_CAT)
         .push_slice(data_duped)
@@ -111,7 +104,7 @@ fn main() {
             witness: Default::default(),
         }],
         output: vec![bitcoin::TxOut {
-            value: 100_000_000,
+            value: 1_000,
             script_pubkey: Address::from_str("bcrt1qlkyvulfwzlquwx5v7drkshr4zgq6f33ekunlj5")
                 .expect("valid address")
                 .assume_checked()
@@ -127,18 +120,21 @@ fn main() {
     });
 
     // Lets create our sighash (to sign payload)
-    println!("Unsigned PSBT: {:?}", psbt);
     let mut sighashcache = sighash::SighashCache::new(&psbt.unsigned_tx);
+    let tapscript_buf = create_taproot_script(data);
+    let tap_leaf_hash = TapLeafHash::from_script(&tapscript_buf, taproot::LeafVersion::TapScript);
+
     let prevouts = psbt
         .inputs
         .iter()
         .map(|i| i.witness_utxo.as_ref().unwrap())
         .collect::<Vec<_>>();
     let sighash = sighashcache
-        .taproot_key_spend_signature_hash(
+        .taproot_script_spend_signature_hash(
             // Only one input specified in the tx above
             0,
             &psbt::Prevouts::All(&prevouts),
+            tap_leaf_hash,
             TapSighashType::All,
         )
         .expect("valid sighash");
@@ -146,14 +142,52 @@ fn main() {
     // Need to tweak the key before signing
     let taproot_spend_info = generate_taproot_spend_info(&SECP, &keypair.public_key(), data);
     let tweaked_keypair = keypair.tap_tweak(&SECP, taproot_spend_info.merkle_root());
+    let control_block = taproot_spend_info
+        .control_block(&(tapscript_buf.clone(), LeafVersion::TapScript))
+        .expect("valid tapscript buf and leaf version");
+
+    let verify_commit = control_block.verify_taproot_commitment(
+        &SECP,
+        tweaked_keypair
+            .to_inner()
+            .public_key()
+            .x_only_public_key()
+            .0,
+        &tapscript_buf,
+    );
+    println!("Verify Commit: {:?}", verify_commit);
+    assert!(verify_commit);
 
     // Sign the sighash
     let message = Message::from_slice(&sighash[..]).expect("valid message");
-    let signature = SECP.sign_schnorr(&message, &tweaked_keypair.to_inner());
+    let signature = SECP.sign_schnorr(&message, &keypair);
     let taproot_signature = taproot::Signature {
         sig: signature,
         hash_ty: TapSighashType::All,
     };
-    psbt.inputs[0].tap_key_sig = Some(taproot_signature);
-    psbt.finalize_mut(&SECP).expect("valid psbt");
+    let mut tap_script_sigs = BTreeMap::new();
+    tap_script_sigs.insert(
+        (keypair.public_key().x_only_public_key().0, tap_leaf_hash),
+        taproot_signature,
+    );
+    psbt.inputs[0].tap_script_sigs = tap_script_sigs;
+    let mut tap_scripts = BTreeMap::new();
+    tap_scripts.insert(
+        control_block.clone(),
+        (tapscript_buf.clone(), LeafVersion::TapScript),
+    );
+    psbt.inputs[0].tap_scripts = tap_scripts;
+
+    // miniscipt will not parse CAT instructions **yet so this is skipped
+    // psbt.finalize_mut(&SECP).expect("valid psbt");
+
+    let wit = Witness::from_vec(vec![tapscript_buf.to_bytes(), control_block.serialize()]);
+    psbt.inputs[0].final_script_witness = Some(wit);
+
+    let final_tx = psbt.extract_tx();
+    let mut tx_bytes = vec![];
+    final_tx.consensus_encode(&mut tx_bytes).expect("valid tx");
+    let hex = hex::encode(tx_bytes);
+    println!("Final TX Hex: {}", hex);
+
 }
